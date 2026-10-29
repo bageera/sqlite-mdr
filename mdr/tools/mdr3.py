@@ -121,7 +121,7 @@ def undelta_bytes(delta, base):
     for _ in range(2):
         seg = delta[off:]
         bodies.append(_decode_seg_body(seg))
-        (clen,) = struct.unpack("<I", seg[6:10])
+        (clen,) = struct.unpack("<I", seg[2:6])
         off += 10 + clen
     opb, litb = bodies
     B = 65536
@@ -153,6 +153,8 @@ def _decode_seg_body(seg, out_len=None):
     if codec == 0:
         return stored
     data = mdrc.zstd_decompress(stored)
+    if codec == 1:
+        return data
     if codec == 2:
         return mdrc.unshuffle_bytes(data, param)
     if codec == 3:
@@ -254,7 +256,8 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None):
                 u += 1
         per_gen_unique.append(u)
         dedup_refs += len(ids)
-    dedup_total = len(dedup_wire) + 16 * seen.__len__()  # index entries
+    dedup_total = len(dedup_wire) + 16 * len(seen) \
+        + 4 + 4 * len(chunk_store)   # lens blob: count + n* u32
     ind_total = sum(c[2] for c in choices) + 4 * len(gens)
     method = "dedup" if dedup_total < ind_total else "pergen"
 
@@ -279,12 +282,14 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None):
                 data_section += item
     else:
         # unique chunks stored once (variable length!); lens walked by id.
-        # chunkstore item = hdr(1+4) + mdrc seg(store) + lens(count u32+n u32)
+        # chunkstore item = hdr(1+4) + mdrc seg(store) + lensblob
+        # lensblob = u32 blob_len + u32 count + count* u32 (self-describing)
         unique_order = list(chunk_store.items())
-        lens = struct.pack("<I", len(unique_order)) + b"".join(
+        lens_blob = struct.pack("<II", 4 * (len(unique_order) + 2),
+                                len(unique_order)) + b"".join(
             struct.pack("<I", len(c)) for _, c in unique_order)
-        item = struct.pack("<BI", 3, len(dedup_wire) + len(lens)) \
-            + dedup_wire + lens
+        item = struct.pack("<BI", 3, len(dedup_wire) + len(lens_blob)) \
+            + dedup_wire + lens_blob
         refs.append({"gen": -1, "kind": "chunkstore", "off": 0, "len": len(item)})
         data_section += item
         for gi, ids in enumerate(chunk_ids):
@@ -376,10 +381,8 @@ def _restore_gen(manifest, index, data, gi, cache):
         out = bytearray()
         for _ in range(nb):
             seg = item[off:]
-            (codec, param) = struct.unpack("<BB", seg[:2])
-            (clen,) = struct.unpack("<I", seg[6:10])
-            stored = seg[10:10 + clen]
-            out += _decode_seg_body(seg)
+            out += _decode_seg_body(seg, out_len=manifest["lengths"][gi])
+            (clen,) = struct.unpack("<I", seg[2:6])
             off += 10 + clen
         return bytes(out[:manifest["lengths"][gi]])
     if kind == "baseref":
@@ -394,13 +397,41 @@ def _restore_gen(manifest, index, data, gi, cache):
         off = 12
         for _ in range(2):
             seg = dl[off:]
-            (clen,) = struct.unpack("<I", seg[6:10])
             bodies.append(_decode_seg_body(seg))
+            (clen,) = struct.unpack("<I", seg[2:6])
             off += 10 + clen
         opb, litb = bodies
         B = 65536
         base_chunks = [base[i:i + B] for i in range(0, len(base), B)]
-        lit_chunks = [litb[i:i + B] for i in range(0, len(litb), B)]
+        # literals are concatenated at TRUE chunk boundaries (variable len):
+        # walk lens from the literal-body reconstruction — literals were
+        # chunked at B boundaries of target, so reconstruct by ops table:
+        # simpler: unchunk literals by replaying ops after building store.
+        lit_pos = {}   # literal idx -> (start, len) filled during replay
+        # first pass: replay ops to find literal lengths
+        lit_starts = []  # (start, len) per literal in order
+        for o in range(0, len(opb), 3):
+            op, idx = struct.unpack("<BH", opb[o:o + 3])
+            if op == 2 and idx == len(lit_starts):
+                lit_starts.append([None, None])
+        # second pass: literal i occupies 64KiB unless it's the final chunk
+        # of target (length = target_len - start). Known via manifest length.
+        tl = manifest["lengths"][gi]
+        Bn = B
+        n_ops = len(opb) // 3
+        lit_seen = {}
+        for oi in range(n_ops):
+            op, idx = struct.unpack("<BH", opb[oi * 3:oi * 3 + 3])
+            start = oi * Bn
+            ln = min(Bn, tl - start)
+            if op == 2:
+                lit_seen[idx] = ln
+        lit_chunks = []
+        p = 0
+        for i in range(len(lit_starts)):
+            ln = lit_seen[i]
+            lit_chunks.append(litb[p:p + ln])
+            p += ln
         out = bytearray()
         o = 0
         while o < len(opb):
@@ -414,14 +445,18 @@ def _restore_gen(manifest, index, data, gi, cache):
                 raise Mdr3Error("bad delta op")
         return bytes(out[:manifest["lengths"][gi]])
     if kind == "chunkstore":
-        # item = hdr(1+4) + mdrc seg(store) + lens(u32 count + n* u32).
+        # item = hdr(1+4) + mdrc seg(store) + lensblob.
+        # lensblob = u32 blob_len L + u32 count + count* u32 lens.
+        # Seg is self-describing: hdr(5) then <BBII> => clen at item[7:11].
         item = data[r["off"]:r["off"] + r["len"]]
-        (count,) = struct.unpack("<I", item[-4:])
-        lens = struct.unpack("<%dI" % count,
-                             item[-4 * (count + 1):-4])
-        wire_len = len(item) - 5 - 4 * (count + 1)
-        seg = item[5:5 + wire_len]
+        (clen,) = struct.unpack("<I", item[7:11])
+        seg = item[5:5 + 10 + clen]
         store = _decode_seg_body(seg)
+        blob = item[5 + 10 + clen:]
+        (L, count) = struct.unpack("<II", blob[:8])
+        if L != len(blob) or count != (L - 8) // 4:
+            raise Mdr3Error("chunkstore lens corrupt")
+        lens = struct.unpack("<%dI" % count, blob[8:8 + 4 * count])
         return ("CHUNKSTORE", store, tuple(lens))
     if kind == "chunklist":
         # dedup scheme: rebuild from chunkstore (refs[0]) + this list.
