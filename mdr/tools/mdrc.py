@@ -243,6 +243,38 @@ def select_and_encode(data, strides=(4, 16), level=19):
     return codec, param, stored
 
 
+def _zstd_probe(data, level=19):
+    return len(zstd_bytes(data, level))
+
+
+def select_and_encode_fast(data, strides=(4, 16), level=19):
+    """Heuristic selector: zstd-only probes on SHORT samples (cheap), then
+    one full encode of the winner. ponytail: constant-stride guess from a
+    64 KiB sample; regret is measured, not assumed (MDR-005)."""
+    OVH = 10
+    S = 65536
+    sample = data[:S] if len(data) > S else data
+    # score candidates by sampled zstd size (raw fallback scored by sample len)
+    scores = {}
+    for codec, param in [(0, 0), (1, 0), (3, 0), (4, 0), (2, 4), (2, 16)]:
+        if codec == 2 and param > len(sample):
+            continue
+        if codec == 0:
+            scores[(0, 0)] = len(sample)
+        elif codec == 1:
+            scores[(1, 0)] = _zstd_probe(sample, level)
+        elif codec == 3:
+            scores[(3, 0)] = _zstd_probe(bit_shuffle(sample), level)
+        elif codec == 4:
+            meta, H, P = page_split(sample)
+            scores[(4, 0)] = _zstd_probe(meta + H + P, level)
+        else:
+            scores[(2, param)] = _zstd_probe(shuffle_bytes(sample, param), level)
+    (codec, param) = min(scores, key=scores.get)
+    stored = encode_segment(codec, param, data)  # single full encode
+    return codec, param, stored
+
+
 # ----------------------------------------------------------------- pack
 def backup_snapshot(db_path):
     """Consistent snapshot via the SQLite backup API; returns bytes."""
@@ -277,7 +309,7 @@ def _backup_bytes(db_path):
 
 
 def pack(src_path, out_path, segment_size=DEFAULT_SEG, use_backup=False,
-         progress=None):
+         progress=None, profile="exhaustive"):
     if segment_size < PAGE:
         raise MdrError("segment-size must be >= %d" % PAGE)
     if use_backup:
@@ -289,9 +321,11 @@ def pack(src_path, out_path, segment_size=DEFAULT_SEG, use_backup=False,
     nseg = max(1, (src_len + segment_size - 1) // segment_size)
     body_blocks = []
     out = {"segments": []}
+    sel = {"exhaustive": select_and_encode,
+           "fast": select_and_encode_fast}[profile]
     for i in range(nseg):
         chunk = data[i * segment_size:(i + 1) * segment_size]
-        codec, param, stored = select_and_encode(chunk)
+        codec, param, stored = sel(chunk)
         seg = struct.pack("<BBII", codec, param, len(stored),
                           zlib.crc32(stored) & 0xFFFFFFFF) + stored
         body_blocks.append(seg)
@@ -434,7 +468,7 @@ def verify(archive_path, full=False):
 # ------------------------------------------------------------------ CLI
 def cmd_pack(args):
     rep = pack(args.input, args.output, segment_size=args.segment_size,
-               use_backup=args.backup)
+               use_backup=args.backup, profile=args.profile)
     if args.report:
         import json
         with open(args.report, "w") as f:
@@ -470,6 +504,9 @@ def main(argv=None):
     pp.add_argument("--backup", action="store_true",
                     help="archive a consistent snapshot via SQLite backup API")
     pp.add_argument("--segment-size", type=int, default=DEFAULT_SEG)
+    pp.add_argument("--profile", choices=("exhaustive", "fast"),
+                    default="exhaustive",
+                    help="selector: exhaustive (trial-all) or fast (sampled)")
     pp.add_argument("--report")
     pp.set_defaults(fn=cmd_pack)
     up = sub.add_parser("unpack")

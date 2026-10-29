@@ -1,15 +1,88 @@
-<h1 align="center">SQLite Source Repository</h1>
+<h1 align="center">SQLite-MDR</h1>
+
+<h3 align="center">Multidimensional archival compression for SQLite databases</h3>
+
+Fork of the [SQLite source tree](https://sqlite.org/src/) (public domain,
+v3.55.0) building **MDR**: an adaptive, lossless archival compression system
+for SQLite databases and their historical snapshots.
+
+> **This README describes this fork, not upstream SQLite.** The upstream
+> engine source under `src/` is untouched on the research branch; the
+> original SQLite README is preserved in the lower half of this file.
+
+## Direction of the project
+
+MDR compresses **archives of SQLite databases**, not live databases. The
+archival layer lives entirely outside the engine (plain Python + zstd CLI
+today) and restores standard `.sqlite` files that any SQLite build can open.
+
+| Branch         | Purpose                                                 |
+| -------------- | ------------------------------------------------------- |
+| `master`       | upstream SQLite tracking mirror (kept pristine)         |
+| `mdr/research` | archive codecs, benchmark/gate suites, math experiments |
+| `mdr/storage`  | reserved for future native engine integration           |
+
+Milestones (reports in `docs/mdr/`, the reasoning map in
+[docs/mdr/science.md](docs/mdr/science.md)):
+
+| Milestone | Result                                                                 |
+| --------- | ---------------------------------------------------------------------- |
+| MDR-001   | MDR1 format: reversible 5D byte permutation, byte-exact roundtrip      |
+| MDR-002   | measured fold benefit on structured fixtures (with regressions)        |
+| MDR-003   | **negative result**: 5D fold ≯ plain byte-shuffle on held-out data     |
+| MDR-004   | `mdrc` CLI + MDR2 format: adaptive per-segment codec portfolio, 45.2% saving vs zstd-19 on a fresh 11-db fleet, gates GA1–GA8 passed |
+| MDR-005   | MDR3 temporal archive: cross-snapshot factorization (shipped with MDR-004) |
+
+Core principle (ADR-004): *codec promotion depends on exact reconstruction,
+complete wire-size accounting, and advantages demonstrated on independent
+workloads.* Dimensionality is a candidate technique, never an assumption.
+
+## Quick start
+
+```sh
+# archive a database (byte-exact contract; --backup for live dbs)
+python3 mdr/tools/mdrc.py pack app.sqlite -o app.mdr [--backup]
+python3 mdr/tools/mdrc.py verify app.mdr --full
+python3 mdr/tools/mdrc.py unpack app.mdr -o restored.sqlite
+
+# temporal archive: many snapshots, one file (MDR3)
+python3 mdr/tools/mdr3.py pack gen0.db gen1.db gen2.db -o history.mdr3
+python3 mdr/tools/mdr3.py unpack history.mdr3 -d outdir/   # all generations
+python3 mdr/tools/mdr3.py unpack history.mdr3 --latest -o latest.sqlite
+
+# acceptance suites (all gates) on freshly built fleets
+python3 benchmarks/mdr/mdr004_acceptance.py
+python3 benchmarks/mdr/mdr005_temporal.py
+```
+
+MDR2 keeps a stored/zstd fallback, so an archive is never meaningfully worse
+than plain zstd of the same bytes (fixed per-segment overhead only).
+
+## Repository layout (MDR additions)
+
+```
+mdr/core/       reversible transforms (5D fold - research)
+mdr/tools/      mdrc.py (MDR2 codec CLI), mdr3.py (MDR3 temporal archive)
+benchmarks/mdr/ benchmark + gate suites per milestone
+docs/mdr/       ADR-001/004, MDR-002/003 reports, science.md
+```
+
+Upstream `src/`, `test/`, `ext/` are untouched on `mdr/research`.
+
+## License & provenance
+
+SQLite sources are public domain. MDR additions inherit it. See
+`LICENSE.md` and the original README section below for upstream details.
+
+---
+
+# SQLite Source Repository (upstream README, preserved below)
 
 This repository contains the complete source code for the
 [SQLite database engine](https://sqlite.org/) going back
 to 2000-05-29.  The tree includes many tests and some
 documentation, though additional tests and most documentation
 are managed separately.
-
-See the [on-line documentation](https://sqlite.org/) for more information
-about what SQLite is and how it works from a user's perspective.  This
-README file is about the source code that goes into building SQLite,
-not about how SQLite is used.
 
 ## Version Control
 
@@ -34,7 +107,7 @@ verify its integrity, there are hints on how to do that in the
 ## Contacting The SQLite Developers
 
 The preferred way to ask questions or make comments about SQLite is to
-visit the [SQLite Forum](https://sqlite.org/forum) at
+visit the [SQLite Forum](https://sqlite.org/forum/) at
 <https://sqlite.org/forum/>.  Anonymous postings are permitted. For
 bug reports, please use the [SQLite bugs
 forum](https://sqlite.org/bugs) at <https://sqlite.org/bugs>.
@@ -46,10 +119,10 @@ email to drh at sqlite dot org.
 ## Public Domain
 
 The SQLite source code is in the public domain.  See
-<https://sqlite.org/copyright.html> for details. 
+<https://sqlite.org/copyright.html> for details.
 
 Because SQLite is in the public domain, we do not normally accept pull
-requests, because if we did take a pull request, the changes in that
+requests, because if we did take a pull request, the changes in this
 pull request might carry a copyright and the SQLite source code would
 then no longer be fully in the public domain.
 
@@ -65,8 +138,8 @@ Source code tarballs or ZIP archives are available at:
      [project timeline](https://sqlite.org/src/timeline?y=ci) and
      click on the check-in hash of the check-in you want to download.
      On the resulting "info" page, click one of the options to the
-     right of the "**Downloads:**" label in the "**Overview**" section
-     near the top.
+     right of the "**Downloads:**" label in the "**Overview:**" section
+     near the top of the page.
 
 To access sources directly using [Fossil](https://fossil-scm.org/home),
 first install Fossil version 2.0 or later.
@@ -162,9 +235,10 @@ TCL library, using a command like this:
 
 SQLite itself does not contain any TCL code, but it does use TCL to run
 tests. You may need to install TCL development libraries in order to
-successfully complete some makefile targets. It is helpful, but is not
-required, to install the SQLite TCL extension (the "tclextension-install"
-target) prior to running tests.
+successfully complete some makefile targets.  It is helpful, but is not
+required, to install the SQLite TCL extension (the
+"tclextension-install" target) prior to running tests.  The "releasetest"
+target has additional requirements, such as "valgrind".
 
 The source tree contains a "make.bat" file that allows the same "make"
 commands of Unix to work on Windows.  In the following, you can substitute
@@ -178,12 +252,14 @@ file:
         make tclextension-install
         make test
         make releasetest
- 
+
 There are many other makefile targets.  See comments in Makefile.msc for
 details.
 
-As with the unix Makefile, the OPTIONS=... argument can be passed on the nmake
-command-line to enable new compile-time options.  For example:
+As with the unix Makefile, the OPTIONS=... argument can be passed on the
+nmake command-line to enable new compile-time options over and above those
+set by ./configure.  For example, to compile with the
+SQLITE_OMIT_DEPRECATED compile-time option, one could say:
 
         make OPTIONS=-DSQLITE_OMIT_DEPRECATED sqlite3.exe
 
@@ -219,7 +295,7 @@ command-line to enable new compile-time options.  For example:
      "ext/misc/" subdirectory contains an assortment of one-file extensions,
      many of which are omitted from the SQLite core, but which are included
      in the [SQLite CLI](https://sqlite.org/cli.html).
-     
+
   *  **doc/** - Some documentation files about SQLite internals are found
      here.  Note, however, that the primary documentation designed for
      application developers and users of SQLite is in a completely separate
@@ -252,8 +328,8 @@ the src/parse.y file.  The conversion of "parse.y" into "parse.c" is done
 by the [lemon](./doc/lemon.html) LALR(1) parser generator.  The source code
 for lemon is at tool/lemon.c.  Lemon uses the tool/lempar.c file as a
 template for generating its parser.
-Lemon also generates the **parse.h** header file, at the same time it
-generates parse.c.
+Lemon also generates the **parse.h** header file, at the same time
+it generates parse.c.
 
 The **opcodes.h** header file contains macros that define the numbers
 corresponding to opcodes in the "VDBE" virtual machine.  The opcodes.h
@@ -265,15 +341,14 @@ opcode-number to opcode-name that is used for EXPLAIN output.
 
 The **keywordhash.h** header file contains the definition of a hash table
 that maps SQL language keywords (ex: "CREATE", "SELECT", "INDEX", etc.) into
-the numeric codes used by the parse.c parser.  The keywordhash.h file is
-generated by a C-language program at tool mkkeywordhash.c.
+the numeric codes used by the parse.c parser.  The keywordhash.h
+file is generated by a C-language program at tool mkkeywordhash.c.
 
 The **pragma.h** header file contains various definitions used to parse
 and implement the PRAGMA statements.  The header is generated by a
 script **tool/mkpragmatab.tcl**. If you want to add a new PRAGMA, edit
-the **tool/mkpragmatab.tcl** file to insert the information needed by the
-parser for your new PRAGMA, then run the script to regenerate the
-**pragma.h** header file.
+the "tool/mkpragmatab.tcl" file so as to insert new information in the
+parser, then "make" the pragma.h file
 
 ### The Amalgamation
 
@@ -282,7 +357,7 @@ and automatically-generated) can be combined into a single big source file
 **sqlite3.c** called "the amalgamation".  The amalgamation is the recommended
 way of using SQLite in a larger application.  Combining all individual
 source code files into a single big source code file allows the C compiler
-to perform more cross-procedure analysis and generate better code.  SQLite
+to perform better cross-procedure analysis and generate better code.  SQLite
 runs about 5% faster when compiled from the amalgamation versus when compiled
 from individual source files.
 
@@ -323,8 +398,8 @@ implementation.  It will not be the easiest library in the world to hack.
 
   *  **sqlite.h.in** - This file defines the public interface to the SQLite
      library.  Readers will need to be familiar with this interface before
-     trying to understand how the library works internally.  This file is
-     really a template that is transformed into the "sqlite3.h" deliverable
+     trying to understand the library internally.  This file
+     is really a template that is transformed into the "sqlite3.h" deliverable
      using a script invoked by the makefile.
 
   *  **sqliteInt.h** - this header file defines many of the data objects
@@ -334,31 +409,32 @@ implementation.  It will not be the easiest library in the world to hack.
      from one release of SQLite to the next.
 
   *  **parse.y** - This file describes the LALR(1) grammar that SQLite uses
-     to parse SQL statements, and the actions that are taken at each step
-     in the parsing process.  The file is processed by the
-     [Lemon Parser Generator](./doc/lemon.html) to produce the actual C code
-     used for parsing.
+     to parse SQL statements and describes what actions each
+     step in the parsing process should take.  The file is processed by
+     the [Lemon Parser Generator](./doc/lemon.html) to produce the actual C code
+     for the parser.
 
   *  **vdbe.c** - This file implements the virtual machine that runs
      prepared statements.  There are various helper files whose names
      begin with "vdbe".  The VDBE has access to the vdbeInt.h header file
-     which defines internal data objects.  The rest of SQLite interacts
-     with the VDBE through an interface defined by vdbe.h.
+     which defines internal data objects used internally.  The rest of SQLite
+     interacts with the VDBE through an interface defined in vdbe.h.
 
   *  **where.c** - This file (together with its helper files named
      by "where*.c") analyzes the WHERE clause and generates
-     virtual machine code to run queries efficiently.  This file is
-     sometimes called the "query optimizer".  It has its own private
-     header file, whereInt.h, that defines data objects used internally.
+     virtual machine code to run queries efficiently.  This file
+     is sometimes called the "query optimizer".  It has its own private
+     header file, whereInt.h, that defines objects used internally.
 
   *  **btree.c** - This file contains the implementation of the B-Tree
      storage engine used by SQLite.  The interface to the rest of the system
-     is defined by "btree.h".  The "btreeInt.h" header defines objects
-     used internally by btree.c and not published to the rest of the system.
+     is defined by "btree.h".  The btreeInt.h header defines objects
+     used internally by sqlite and not generally published to
+     readers of the sources.
 
   *  **pager.c** - This file contains the "pager" implementation, the
      module that implements transactions.  The "pager.h" header file
-     defines the interface between pager.c and the rest of the system.
+     defines the interface between the pager and the rest of the system.
 
   *  **os_unix.c** and **os_win.c** - These two files implement the interface
      between SQLite and the underlying operating system using the run-time
@@ -369,20 +445,20 @@ implementation.  It will not be the easiest library in the world to hack.
      "sqlite3.exe" command-line shell.  The "shell.c.in" file is transformed
      into "shell.c" as part of the build process.
 
-  *  **tclsqlite.c** - This file implements the Tcl bindings for SQLite.  It
+  *  **tclsqlite.c** - This file implements the Tcl bindings for SQLite.  This
      is not part of the core SQLite library.  But as most of the tests in this
      repository are written in Tcl, the Tcl language bindings are important.
 
   *  **test\*.c** - Files in the src/ folder that begin with "test" go into
      building the "testfixture.exe" program.  The testfixture.exe program is
      an enhanced Tcl shell.  The testfixture.exe program runs scripts in the
-     test/ folder to validate the core SQLite code.  The testfixture program
-     (and some other test programs too) is built and run when you type
-     "make test".
+     test/ folder to validate the core SQLite code.  The testfixture
+     program (and some other test programs too) is built and run when you
+     type "make test".
 
   *  **VERSION**, **manifest**, **manifest.tags**, and **manifest.uuid** -
-     These files define the current SQLite version number. The "VERSION" file
-     is human generated, but the "manifest", "manifest.tags", and
+     These files define the current SQLite version number. The "VERSION"
+     file is human generated, but the "manifest", "manifest.tags", and
      "manifest.uuid" files are automatically generated by the
      [Fossil version control system](https://fossil-scm.org/).
 
@@ -405,7 +481,7 @@ you can be confident that your source tree is authentic and unadulterated.
 Details on the format for the `manifest` files are available
 [on the Fossil website](https://fossil-scm.org/home/doc/trunk/www/fileformat.wiki#manifest).
 
-The process of checking source code authenticity is automated by the 
+The process of checking source code authenticity is automated by the
 makefile:
 
 >   make verify-source

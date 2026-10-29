@@ -1,0 +1,7 @@
+# Fossil/git runtime artifacts
+*.part
+emcc/
+.wasm-fetch-time*
+# MDR benchmark artifacts: generated fixture DBs, archives, result JSONs.
+# Keep the scripts; regenerate outputs with the suites in benchmarks/mdr/.
+benchmarks/mdr/out/
