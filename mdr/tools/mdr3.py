@@ -31,6 +31,7 @@ GT7: corrupt/missing-base detection via sha + manifest lengths.
 """
 
 import argparse
+import collections
 import hashlib
 import json
 import os
@@ -110,6 +111,48 @@ def delta_bytes(target, base):
             _seg_wire_best(opb) + _seg_wire_best(litb))
 
 
+# ------------------------------------------------- fingerprint ranking
+FP_PAGE = 4096        # page-level fingerprint granularity
+FP_STRIPE = 512       # sampled stripe inside each page (order-independent)
+FP_NSTRIPES = 8       # fingerprints per page: stripes at fixed offsets
+
+
+def fingerprint(data):
+    """Order-independent multiset fingerprint: per-page, multiset of
+    (n_stripe_hashes, full-256b-page-hash when page == FP_PAGE-aligned).
+
+    Page CONTENT fingerprints are position-free (stripes sampled at fixed
+    intra-page offsets), so identical pages yield identical fingerprints
+    even after the page MOVES elsewhere in the file.
+    """
+    pages = [data[i:i + FP_PAGE] for i in range(0, len(data), FP_PAGE)]
+    fp = collections.Counter()
+    for pg in pages:
+        h = hashlib.sha256(pg).digest()[:12]
+        fp[h] += 1
+    return fp
+
+
+def fp_overlap(a, b):
+    """Multiset intersection size (sum of min counts)."""
+    inter = 0
+    for h, c in a.items():
+        c2 = b.get(h)
+        if c2:
+            inter += c if c2 >= c else c2
+    return inter
+
+
+def rank_bases(target_fp, history_fps, top=2):
+    """Return indices of the `top` history snapshots with most page overlap,
+    highest first. Ties -> lower index (older) first for determinism."""
+    scored = []
+    for gi, f in enumerate(history_fps):
+        scored.append((-fp_overlap(target_fp, f), gi))
+    scored.sort()
+    return [gi for _, gi in scored[:top]]
+
+
 def undelta_bytes(delta, base):
     (blen, nbc) = struct.unpack("<QI", delta[:12])
     if blen != len(base):
@@ -142,6 +185,12 @@ def undelta_bytes(delta, base):
 
 
 # helper: decode via mdrc.decode_segment with correct out_len semantics
+def _meta_len_of(data):
+    """Byte length of the D3 page-split meta (u32 count + count* u16 hss)."""
+    (npages,) = struct.unpack("<H", data[:2])
+    return 2 + 2 * npages
+
+
 def _decode_seg_body(seg, out_len=None):
     # seg layout = mdrc segment: <BBII> codec, param, clen, crc | clen bytes
     codec, param = struct.unpack("<BB", seg[:2])
@@ -160,19 +209,27 @@ def _decode_seg_body(seg, out_len=None):
     if codec == 3:
         return mdrc.unbit_shuffle(data)
     if codec == 4:
-        meta_len = 2 + 2 * struct.unpack("<H", data[:2])[0]
+        meta_len = _meta_len_of(data)
+        if meta_len > len(data):
+            raise Mdr3Error("bad D3 meta length")
         (npages,) = struct.unpack("<H", data[:2])
         hss = struct.unpack("<%dH" % npages, data[2:meta_len])
         rest = data[meta_len:]
         H_total = sum(hss)
-        return mdrc.page_join(data[2:meta_len], rest[:H_total],
-                              rest[H_total:],
-                              pad_total=out_len + (-out_len % mdrc.PAGE))
+        if out_len is None:
+            out_len = npages * mdrc.PAGE   # full-page-span body
+        return mdrc.page_join(meta_len, hss, rest[:H_total],
+                              rest[H_total:], pad_total=out_len
+                              + (-out_len % mdrc.PAGE))
     raise Mdr3Error("codec %d not supported in MDR3 bodies" % codec)
 
 
 # ------------------------------------------------------------- pack
-def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None):
+def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None,
+         selector="exhaustive", fp_top=2, force_method=None):
+    """selector: 'exhaustive' (all bases tried) or 'ranked' (fingerprint
+    top-`fp_top` bases tried; exhaustive kept as reference/gate arm).
+    force_method: 'pergen'/'dedup' to pin the archive scheme (gate use)."""
     gens = []
     gen_meta = []   # sha, len per generation
     for p in inPaths:
@@ -214,6 +271,12 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None):
     for gi, g in enumerate(gens):
         bodies = [_seg_wire_best(c) for c in chunk_bytes(g, SEG)]
         independent_wires.append(bodies)
+    # fingerprints for ranked selection (cheap: 1 hash/page, no encoding)
+    history_fps = []
+    if selector == "ranked":
+        for g in gens:
+            history_fps.append(fingerprint(g))
+    trials_done = 0
     # baseref candidates per generation (t>0): try EVERY earlier gen as base
     # baseref item = delta_bytes; chain rule: base must itself be restorable
     # with depth < max_depth. We approximate "restorable" by generation index
@@ -224,9 +287,18 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None):
         if gi == 0:
             choices.append(("independent", 0, ind_cost))
             continue
+        if selector == "ranked":
+            cand = [bi for bi in rank_bases(history_fps[gi],
+                                            history_fps[:gi], top=fp_top)
+                    if bi >= gi - max_depth]
+            if gi - 1 not in cand:      # always allow nearest generation
+                cand.append(gi - 1)
+        else:
+            cand = list(range(max(0, gi - max_depth), gi))
         best = None
-        for bi in range(max(0, gi - max_depth), gi):
+        for bi in cand:
             dl = delta_bytes(g, gens[bi])
+            trials_done += 1
             # delta is stored as ONE item; cost = len(dl) + ref overhead
             cost = len(dl) + 12  # ref = 4B base id + 8B length
             if best is None or cost < best[2]:
@@ -259,23 +331,22 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None):
     dedup_total = len(dedup_wire) + 16 * len(seen) \
         + 4 + 4 * len(chunk_store)   # lens blob: count + n* u32
     ind_total = sum(c[2] for c in choices) + 4 * len(gens)
-    method = "dedup" if dedup_total < ind_total else "pergen"
+    method = force_method if force_method else \
+        ("dedup" if dedup_total < ind_total else "pergen")
 
     # --- emit
     data_section = bytearray()
     refs = []
     if method == "pergen":
-        for gi, (m, bi, cost) in enumerate(choices):
+        for gi, ch in enumerate(choices):
+            m, bi, cost = ch[0], ch[1], ch[2]
             if m == "independent":
                 blobs = independent_wires[gi]
                 item = struct.pack("<BIB", 1, len(blobs), 0) + b"".join(blobs)
                 refs.append({"gen": gi, "kind": "independent", "off": len(data_section), "len": len(item)})
                 data_section += item
             else:
-                dl = delta_bytes(gens[gi], gens[bi]) if len(
-                    [x for x in (choices[gi],)]) == 1 else choices[gi][3]
-                if isinstance(dl, tuple):
-                    dl = dl[3]
+                dl = ch[3] if len(ch) > 3 else delta_bytes(gens[gi], gens[bi])
                 item = struct.pack("<BIB", 2, 1, bi) + dl
                 refs.append({"gen": gi, "kind": "baseref", "base": bi,
                              "off": len(data_section), "len": len(item)})
@@ -305,6 +376,9 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None):
     manifest["items"] = refs
     manifest["hashes"] = gen_meta
     manifest["lengths"] = [len(g) for g in gens]
+    manifest["selector"] = selector
+    assert 0 <= trials_done < 10 ** 10
+    manifest["selector_trials"] = "%010d" % trials_done  # byte-stable json
     man_b = json.dumps(manifest, separators=(",", ":")).encode()
     idx_b = json.dumps({"chunk_size": B if method == "dedup" else None,
                         "seg_size": SEG},
@@ -332,7 +406,8 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None):
     return {"generations": len(gens), "method": method,
             "manifest_bytes": len(man_b), "data_bytes": len(data_section),
             "archive": len(header) + len(body) + len(footer),
-            "raw_total": sum(len(g) for g in gens)}
+            "raw_total": sum(len(g) for g in gens),
+            "selector": selector, "delta_trials": trials_done}
 
 
 # ------------------------------------------------------------- unpack

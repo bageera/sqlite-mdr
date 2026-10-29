@@ -116,9 +116,7 @@ def page_split(data):
     return meta, bytes(H), bytes(P)
 
 
-def page_join(meta, H, P, pad_total):
-    (npages,) = struct.unpack("<H", meta[:2])
-    hss = struct.unpack("<%dH" % npages, meta[2:])
+def page_join(meta_len, hss, H, P, pad_total):
     hi = pi = 0
     buf = bytearray()
     for hs in hss:
@@ -217,7 +215,8 @@ def decode_segment(codec, param, stored, out_len):
         H_total = sum(hss)
         if H_total > len(rest) or npages * PAGE != len(rest):
             raise MdrError("bad D3 split lengths")
-        data = page_join(meta, rest[:H_total], rest[H_total:], pad_total=out_len + (-out_len % PAGE))
+        data = page_join(meta_len, hss, rest[:H_total], rest[H_total:],
+                         pad_total=out_len + (-out_len % PAGE))
     else:
         raise MdrError("unknown codec %d" % codec)
     return data[:out_len]
