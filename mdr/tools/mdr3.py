@@ -106,8 +106,11 @@ def delta_bytes(target, base):
             ops.append(struct.pack("<BH", 2, lit_ids[h]))
     opb = b"".join(ops)
     litb = b"".join(literals)
-    # wire: ops stream + literal body (each mdrc-compressed, charged)
-    return (struct.pack("<QI", len(base), len(base_chunks)) +
+    # wire: u64 base_len + u32 base_chunks + u32 opb_len + u32 litb_len
+    #       + mdrc(opb) + mdrc(litb). Explicit body lengths let the D3
+    #   codec decode exactly (no page-pad ambiguity).
+    return (struct.pack("<QIII", len(base), len(base_chunks),
+                        len(opb), len(litb)) +
             _seg_wire_best(opb) + _seg_wire_best(litb))
 
 
@@ -118,23 +121,25 @@ FP_NSTRIPES = 8       # fingerprints per page: stripes at fixed offsets
 
 
 def fingerprint(data):
-    """Order-independent multiset fingerprint: per-page, multiset of
-    (n_stripe_hashes, full-256b-page-hash when page == FP_PAGE-aligned).
-
-    Page CONTENT fingerprints are position-free (stripes sampled at fixed
-    intra-page offsets), so identical pages yield identical fingerprints
-    even after the page MOVES elsewhere in the file.
-    """
+    """Two-tier order-independent page fingerprint: exact page hashes PLUS
+    512B stride samples for near-match ranking. Exact hashes detect identical
+    pages; sampled stripes give partial credit for pages differing by a few
+    bytes (the L5-adversary case). Both are position-free.
+    Returns (exact Counter, sampled Counter)."""
     pages = [data[i:i + FP_PAGE] for i in range(0, len(data), FP_PAGE)]
-    fp = collections.Counter()
+    exact = collections.Counter()
+    sampled = collections.Counter()
     for pg in pages:
-        h = hashlib.sha256(pg).digest()[:12]
-        fp[h] += 1
-    return fp
+        exact[hashlib.sha256(pg).digest()[:12]] += 1
+        for off in range(0, FP_PAGE, FP_STRIPE):
+            if off + FP_STRIPE <= len(pg):
+                sampled[hashlib.sha256(pg[off:off + FP_STRIPE])
+                        .digest()[:8]] += 1
+    return (exact, sampled)
 
 
 def fp_overlap(a, b):
-    """Multiset intersection size (sum of min counts)."""
+    """Multiset intersection size (sum of min counts). Exact tier only."""
     inter = 0
     for h, c in a.items():
         c2 = b.get(h)
@@ -143,14 +148,25 @@ def fp_overlap(a, b):
     return inter
 
 
+def fp_overlap_hybrid(a, b):
+    """(exact_inter, sampled_inter) between two (exact, sampled) tuples."""
+    ea, sa = a
+    eb, sb = b
+    return fp_overlap(ea, eb), fp_overlap(sa, sb)
+
+
 def rank_bases(target_fp, history_fps, top=2):
-    """Return indices of the `top` history snapshots with most page overlap,
-    highest first. Ties -> lower index (older) first for determinism."""
+    """Hybrid similarity ranking: exact page overlap dominates, sampled
+    stripe overlap breaks near-ties (partial-page-edit affinity). Returns
+    indices of the `top` most similar history snapshots, highest first.
+    Ties -> lower index (older) first for determinism."""
     scored = []
     for gi, f in enumerate(history_fps):
-        scored.append((-fp_overlap(target_fp, f), gi))
+        ex, sm = fp_overlap_hybrid(target_fp, f)
+        # lexicographic: exact overlap first, then sampled overlap
+        scored.append((-ex, -sm, gi))
     scored.sort()
-    return [gi for _, gi in scored[:top]]
+    return [gi for _, _, gi in scored[:top]]
 
 
 def undelta_bytes(delta, base):
@@ -158,12 +174,13 @@ def undelta_bytes(delta, base):
     if blen != len(base):
         raise Mdr3Error("delta base length mismatch (got base %d, want %d)"
                         % (len(base), blen))
-    # parse: first two segment bodies (len-prefixed mdrc segment format)
-    off = 12
+    # parse: u32 opb_len + u32 litb_len, then two mdrc segments
+    (opb_len, litb_len) = struct.unpack("<II", delta[12:20])
+    off = 20
     bodies = []
-    for _ in range(2):
+    for blen in (opb_len, litb_len):
         seg = delta[off:]
-        bodies.append(_decode_seg_body(seg))
+        bodies.append(_decode_seg_body(seg, out_len=blen))
         (clen,) = struct.unpack("<I", seg[2:6])
         off += 10 + clen
     opb, litb = bodies
@@ -205,10 +222,10 @@ def _decode_seg_body(seg, out_len=None):
     if codec == 1:
         return data
     if codec == 2:
-        return mdrc.unshuffle_bytes(data, param)
-    if codec == 3:
-        return mdrc.unbit_shuffle(data)
-    if codec == 4:
+        data = mdrc.unshuffle_bytes(data, param)
+    elif codec == 3:
+        data = mdrc.unbit_shuffle(data)
+    elif codec == 4:
         meta_len = _meta_len_of(data)
         if meta_len > len(data):
             raise Mdr3Error("bad D3 meta length")
@@ -218,10 +235,15 @@ def _decode_seg_body(seg, out_len=None):
         H_total = sum(hss)
         if out_len is None:
             out_len = npages * mdrc.PAGE   # full-page-span body
-        return mdrc.page_join(meta_len, hss, rest[:H_total],
-                              rest[H_total:], pad_total=out_len
-                              + (-out_len % mdrc.PAGE))
-    raise Mdr3Error("codec %d not supported in MDR3 bodies" % codec)
+        data = mdrc.page_join(meta_len, hss, rest[:H_total], rest[H_total:],
+                              pad_total=out_len + (-out_len % mdrc.PAGE))
+    else:
+        raise Mdr3Error("codec %d not supported in MDR3 bodies" % codec)
+    # transform-based codecs pad bodies (stride/bit/D3 page) — trim to the
+    # declared length when the caller supplies one.
+    if out_len is not None:
+        data = data[:out_len]
+    return data
 
 
 # ------------------------------------------------------------- pack
@@ -468,11 +490,12 @@ def _restore_gen(manifest, index, data, gi, cache):
         item = data[r["off"]:r["off"] + r["len"]]
         dl = item[6:]
         (blen, nbc) = struct.unpack("<QI", dl[:12])
+        (opb_len, litb_len) = struct.unpack("<II", dl[12:20])
         bodies = []
-        off = 12
-        for _ in range(2):
+        off = 20
+        for body_len in (opb_len, litb_len):
             seg = dl[off:]
-            bodies.append(_decode_seg_body(seg))
+            bodies.append(_decode_seg_body(seg, out_len=body_len))
             (clen,) = struct.unpack("<I", seg[2:6])
             off += 10 + clen
         opb, litb = bodies
