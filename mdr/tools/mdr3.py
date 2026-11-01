@@ -310,9 +310,15 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None,
             choices.append(("independent", 0, ind_cost))
             continue
         if selector == "ranked":
-            cand = [bi for bi in rank_bases(history_fps[gi],
-                                            history_fps[:gi], top=fp_top)
-                    if bi >= gi - max_depth]
+            # Rank WITHIN the depth window: ranking against the full
+            # history wastes the fp_top budget on out-of-window bases
+            # (L6 gen10 at depth 8: full-history top-2 = gens 0,1, both
+            # outside window -> forced t-1 was 9 churn steps off).
+            lo = max(0, gi - max_depth)
+            pool = list(range(lo, gi))
+            keep = rank_bases(history_fps[gi],
+                              [history_fps[b] for b in pool], top=fp_top)
+            cand = [pool[t] for t in keep]
             if gi - 1 not in cand:      # always allow nearest generation
                 cand.append(gi - 1)
         else:
