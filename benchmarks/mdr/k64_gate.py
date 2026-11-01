@@ -245,6 +245,14 @@ def main():
         assert len(paths) == SNAPSHOTS
         gens = [open(p, "rb").read() for p in paths]
 
+        # pergen forced (for the G8 mdr3-candidate min)
+        pgarc = os.path.join(OUT, "%s_pg.mdr3" % name)
+        repp = mdr3.pack(paths, pgarc, selector="ranked",
+                         force_method="pergen")
+        pergen = repp["archive"]
+        pg_exact = restore_exact_b0(paths, pgarc)
+        os.unlink(pgarc)
+
         # B0: mdr3 dedup forced, ranked selector
         b0arc = os.path.join(OUT, "%s_b0.mdr3" % name)
         t0 = time.perf_counter()
@@ -283,6 +291,7 @@ def main():
             "B0_pack_s": round(t0s, 1), "K6_pack_s": round(tks, 1),
             "B1_pack_s": round(t1s, 1),
             "B0_exact": b0_exact, "K6_exact": k6_exact,
+            "pergen": pergen, "pergen_exact": pg_exact,
         }
         rows.append(row)
         print("%-3s n=%d raw=%8d | B0 %8d B1 %8d K6 %8d | d0 %+8d d1 %+8d | "
