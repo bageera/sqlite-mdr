@@ -112,9 +112,25 @@ def _decode_seg(seg, out_len=None):
         return data
     if codec == 2:
         data = mdrc.unshuffle_bytes(data, param)
-    if codec == 3:
+    elif codec == 3:
         data = mdrc.unbit_shuffle(data)
-    # transform codecs pad to the stride multiple; trim to the declared
+    elif codec == 4:
+        # D3 page codec: stored = meta + split body; page_join rebuilds
+        # (same discipline as mdr3._decode_seg_body; raw length required)
+        if len(data) < 2:
+            raise Mdr6Error("D3 body short")
+        (npages,) = struct.unpack("<H", data[:2])
+        meta_len = 2 + 2 * npages
+        hss = struct.unpack("<%dH" % npages, data[2:meta_len])
+        rest = data[meta_len:]
+        H_total = sum(hss)
+        if out_len is None:
+            raise Mdr6Error("D3 body missing declared raw length")
+        data = mdrc.page_join(meta_len, hss, rest[:H_total], rest[H_total:],
+                              pad_total=out_len + (-out_len % mdrc.PAGE))
+    else:
+        raise Mdr6Error("codec %d not supported in K6 bodies" % codec)
+    # transform codecs pad to the stride/page multiple; trim to the declared
     # raw length (out_len) so op-stream arithmetic stays exact
     if out_len is None:
         raise Mdr6Error("transform-coded body missing declared raw length")
