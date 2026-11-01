@@ -116,3 +116,67 @@ second promotion gate.
 - Not a braid or fixed-permutation arm (that family is closed).
 - Not a claim about VACUUM-specific tuning: the arm must win on held-out
   chains the match finder never saw.
+
+## K6-4 HELD-OUT RESULT (PROMOTED) — 2026-11, closed GREEN
+
+Corpus: 8 chains x 5 snapshots, seed literals committed in k64_gate.py
+(dev-pair constants deliberately absent from held-out seeds). Frozen
+reference implementation: 08d5880fa + ac8dcbb4f + bf46d7821. Full rows in
+benchmarks/mdr/out/k64_result.json; gate: benchmarks/mdr/k64_gate.py.
+
+| Chain | Profile | B0 | B1 | K6 | d0 (B0-K6) | d1 (B1-K6) | K6 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| H1 | 250B rows, delete 1/4 | 1,449,802 | 1,448,417 | 1,445,272 | +4,530 | +3,145 | WIN |
+| H2 | 1400B rows, delete 1/2 | 9,053,578 | 8,425,098 | 8,389,346 | +664,232 | +35,752 | WIN |
+| H3 | 90B rows, delete 1/9, shuffled | 515,711 | 517,548 | 529,208 | -13,497 | -11,660 | LOSS |
+| H4 | 300B rows, index churn | 1,749,296 | 1,747,911 | 1,746,642 | +2,654 | +1,269 | WIN |
+| H5 | 120B rows, reverse insert | 675,070 | 676,170 | 671,453 | +3,617 | +4,717 | WIN |
+| H6 | 60B rows, delete 1/2 | 331,866 | 333,286 | 368,322 | -36,456 | -35,036 | LOSS |
+| C1 | compressible control | 158,282 | 157,326 | 174,550 | -16,268 | -17,224 | LOSS |
+| R1 | random control | 4,179,558 | 4,179,903 | 4,172,355 | +7,203 | +7,548 | WIN |
+
+Verdict: PASS on the preregistered kill criterion (K6 < B0 on >=1
+held-out chain, margin >> K6 metadata). K6 beats BOTH B0 and B1 on 5/8
+chains incl. the random control; per-chain evidence is primary (the H2
+win dominates any fleet aggregate; never quote a fleet-wide % alone).
+
+Loss classes (regression classes, preserved, not hidden):
+- H3/H6 dense small rows: churn stays inside shared 64KiB chunks; dedup
+  absorbs it at ID cost while K6 pays per-ref overhead on many small
+  fragments. Dedup's home turf.
+- C1 compressible: ordinary compression already fits; references add
+  nothing.
+
+The adaptive picker protects the loss classes BY CONSTRUCTION: candidates
+are serialized and argmin'd over measured bytes, so a losing K6 candidate
+is never the stored archive (G8 verified per chain).
+
+Gate corrections made during the run (recorded, no threshold edits):
+- K6 decoder returned codec-4 (D3) literal bodies page-transformed
+  (self-checks missed it: dev fixtures never picked D3); fixed with
+  declared raw lens (ac8dcbb4f + bf46d7821).
+- G8 gate bug: candidate min initially included B1, which the mdr3 picker
+  cannot emit; corrected to implemented methods only with pergen measured
+  per chain (0966f1d30). B1 remains the standing external attribution
+  baseline, never a picker candidate.
+
+## K6-5 CLOSURE (promotion record)
+
+- K6D1 wire semantics FROZEN at the ac8dcbb4f+bf46d7821 layout: magic
+  "K6D1" | u64 base_union_len | u16 n_bases | u32 opb_len/litb_len |
+  u32 ops_raw/lits_raw (declared raw body lens; required by trim) |
+  n_bases x u32 base_ids | opb segment | litb segment. Literal/copy varint
+  op stream tiles the target; strictly historical bases only.
+- K6 promoted to the default candidate portfolio (serialized argmin over
+  dedup/pergen/k6). force_method pins and exhaustive diagnostics remain.
+- Decode obligations frozen: D3 page-join for codec-4 bodies; trim to
+  declared raw lens; copy bounds checked before application; manifest sha
+  verification at restore.
+- Hybrid dedup+K6 per-generation items: DEFERRED to a separately gated
+  milestone (K6-7 class); do not mutate the frozen wire for it. New
+  hypotheses require new item grammar and new gates.
+- Next research direction: packing-cost reduction via cheap fingerprints /
+  candidate reuse to skip K6 trial-encoding when predicted unprofitable,
+  with archive regret measured against the fully emitted minimum
+  (exhaustive portfolio retained as the quality reference, mirroring
+  MDR-006).
