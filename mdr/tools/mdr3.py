@@ -46,7 +46,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, os.path.join(ROOT, "mdr", "tools"))
 
-import mdrc  # noqa: E402
+import mdrc   # noqa: E402
+import mdrk6  # noqa: E402  (K6 sub-page historical reference codec)
 
 MAGIC_HDR = b"MDR3"
 MAGIC_FTR = b"M3DN"
@@ -106,8 +107,11 @@ def delta_bytes(target, base):
             ops.append(struct.pack("<BH", 2, lit_ids[h]))
     opb = b"".join(ops)
     litb = b"".join(literals)
-    # wire: ops stream + literal body (each mdrc-compressed, charged)
-    return (struct.pack("<QI", len(base), len(base_chunks)) +
+    # wire: u64 base_len + u32 base_chunks + u32 opb_len + u32 litb_len
+    #       + mdrc(opb) + mdrc(litb). Explicit body lengths let the D3
+    #   codec decode exactly (no page-pad ambiguity).
+    return (struct.pack("<QIII", len(base), len(base_chunks),
+                        len(opb), len(litb)) +
             _seg_wire_best(opb) + _seg_wire_best(litb))
 
 
@@ -118,23 +122,25 @@ FP_NSTRIPES = 8       # fingerprints per page: stripes at fixed offsets
 
 
 def fingerprint(data):
-    """Order-independent multiset fingerprint: per-page, multiset of
-    (n_stripe_hashes, full-256b-page-hash when page == FP_PAGE-aligned).
-
-    Page CONTENT fingerprints are position-free (stripes sampled at fixed
-    intra-page offsets), so identical pages yield identical fingerprints
-    even after the page MOVES elsewhere in the file.
-    """
+    """Two-tier order-independent page fingerprint: exact page hashes PLUS
+    512B stride samples for near-match ranking. Exact hashes detect identical
+    pages; sampled stripes give partial credit for pages differing by a few
+    bytes (the L5-adversary case). Both are position-free.
+    Returns (exact Counter, sampled Counter)."""
     pages = [data[i:i + FP_PAGE] for i in range(0, len(data), FP_PAGE)]
-    fp = collections.Counter()
+    exact = collections.Counter()
+    sampled = collections.Counter()
     for pg in pages:
-        h = hashlib.sha256(pg).digest()[:12]
-        fp[h] += 1
-    return fp
+        exact[hashlib.sha256(pg).digest()[:12]] += 1
+        for off in range(0, FP_PAGE, FP_STRIPE):
+            if off + FP_STRIPE <= len(pg):
+                sampled[hashlib.sha256(pg[off:off + FP_STRIPE])
+                        .digest()[:8]] += 1
+    return (exact, sampled)
 
 
 def fp_overlap(a, b):
-    """Multiset intersection size (sum of min counts)."""
+    """Multiset intersection size (sum of min counts). Exact tier only."""
     inter = 0
     for h, c in a.items():
         c2 = b.get(h)
@@ -143,14 +149,25 @@ def fp_overlap(a, b):
     return inter
 
 
+def fp_overlap_hybrid(a, b):
+    """(exact_inter, sampled_inter) between two (exact, sampled) tuples."""
+    ea, sa = a
+    eb, sb = b
+    return fp_overlap(ea, eb), fp_overlap(sa, sb)
+
+
 def rank_bases(target_fp, history_fps, top=2):
-    """Return indices of the `top` history snapshots with most page overlap,
-    highest first. Ties -> lower index (older) first for determinism."""
+    """Hybrid similarity ranking: exact page overlap dominates, sampled
+    stripe overlap breaks near-ties (partial-page-edit affinity). Returns
+    indices of the `top` most similar history snapshots, highest first.
+    Ties -> lower index (older) first for determinism."""
     scored = []
     for gi, f in enumerate(history_fps):
-        scored.append((-fp_overlap(target_fp, f), gi))
+        ex, sm = fp_overlap_hybrid(target_fp, f)
+        # lexicographic: exact overlap first, then sampled overlap
+        scored.append((-ex, -sm, gi))
     scored.sort()
-    return [gi for _, gi in scored[:top]]
+    return [gi for _, _, gi in scored[:top]]
 
 
 def undelta_bytes(delta, base):
@@ -158,12 +175,13 @@ def undelta_bytes(delta, base):
     if blen != len(base):
         raise Mdr3Error("delta base length mismatch (got base %d, want %d)"
                         % (len(base), blen))
-    # parse: first two segment bodies (len-prefixed mdrc segment format)
-    off = 12
+    # parse: u32 opb_len + u32 litb_len, then two mdrc segments
+    (opb_len, litb_len) = struct.unpack("<II", delta[12:20])
+    off = 20
     bodies = []
-    for _ in range(2):
+    for blen in (opb_len, litb_len):
         seg = delta[off:]
-        bodies.append(_decode_seg_body(seg))
+        bodies.append(_decode_seg_body(seg, out_len=blen))
         (clen,) = struct.unpack("<I", seg[2:6])
         off += 10 + clen
     opb, litb = bodies
@@ -205,10 +223,10 @@ def _decode_seg_body(seg, out_len=None):
     if codec == 1:
         return data
     if codec == 2:
-        return mdrc.unshuffle_bytes(data, param)
-    if codec == 3:
-        return mdrc.unbit_shuffle(data)
-    if codec == 4:
+        data = mdrc.unshuffle_bytes(data, param)
+    elif codec == 3:
+        data = mdrc.unbit_shuffle(data)
+    elif codec == 4:
         meta_len = _meta_len_of(data)
         if meta_len > len(data):
             raise Mdr3Error("bad D3 meta length")
@@ -218,10 +236,15 @@ def _decode_seg_body(seg, out_len=None):
         H_total = sum(hss)
         if out_len is None:
             out_len = npages * mdrc.PAGE   # full-page-span body
-        return mdrc.page_join(meta_len, hss, rest[:H_total],
-                              rest[H_total:], pad_total=out_len
-                              + (-out_len % mdrc.PAGE))
-    raise Mdr3Error("codec %d not supported in MDR3 bodies" % codec)
+        data = mdrc.page_join(meta_len, hss, rest[:H_total], rest[H_total:],
+                              pad_total=out_len + (-out_len % mdrc.PAGE))
+    else:
+        raise Mdr3Error("codec %d not supported in MDR3 bodies" % codec)
+    # transform-based codecs pad bodies (stride/bit/D3 page) — trim to the
+    # declared length when the caller supplies one.
+    if out_len is not None:
+        data = data[:out_len]
+    return data
 
 
 # ------------------------------------------------------------- pack
@@ -264,6 +287,8 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None,
                    for h in chunk_store]
 
     # --- per-generation: independent vs baseref vs (metadata-only) dedup
+    # K6 (sub-page historical refs) is evaluated as a third per-gen arm under
+    # the same ranked-candidate discipline (MDR-006 Law 1: rank within window).
     items = []          # data section payloads, referenced by manifest
     manifest = {"generations": [], "items": [], "max_depth": max_depth}
     # store gen0 as independent
@@ -273,24 +298,30 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None,
         independent_wires.append(bodies)
     # fingerprints for ranked selection (cheap: 1 hash/page, no encoding)
     history_fps = []
-    if selector == "ranked":
-        for g in gens:
-            history_fps.append(fingerprint(g))
+    for g in gens:
+        history_fps.append(fingerprint(g))
     trials_done = 0
     # baseref candidates per generation (t>0): try EVERY earlier gen as base
     # baseref item = delta_bytes; chain rule: base must itself be restorable
     # with depth < max_depth. We approximate "restorable" by generation index
     # depth (linear history), charging nothing else.
     choices = []
+    k6_wires = {}     # gi -> k6 wire bytes (computed for ranked/tried gens)
+    use_k6 = force_method in (None, "k6")
     for gi, g in enumerate(gens):
-        ind_cost = sum(len(b) for b in independent_wires[gi]) + OVH_SEG * len(independent_wires[gi]) + 4
         if gi == 0:
-            choices.append(("independent", 0, ind_cost))
+            choices.append(("independent", 0, 0))
             continue
         if selector == "ranked":
-            cand = [bi for bi in rank_bases(history_fps[gi],
-                                            history_fps[:gi], top=fp_top)
-                    if bi >= gi - max_depth]
+            # Rank WITHIN the depth window: ranking against the full
+            # history wastes the fp_top budget on out-of-window bases
+            # (L6 gen10 at depth 8: full-history top-2 = gens 0,1, both
+            # outside window -> forced t-1 was 9 churn steps off).
+            lo = max(0, gi - max_depth)
+            pool = list(range(lo, gi))
+            keep = rank_bases(history_fps[gi],
+                              [history_fps[b] for b in pool], top=fp_top)
+            cand = [pool[t] for t in keep]
             if gi - 1 not in cand:      # always allow nearest generation
                 cand.append(gi - 1)
         else:
@@ -300,114 +331,170 @@ def pack(inPaths, outPath, max_depth=MAX_DEPTH_DEFAULT, progress=None,
             dl = delta_bytes(g, gens[bi])
             trials_done += 1
             # delta is stored as ONE item; cost = len(dl) + ref overhead
-            cost = len(dl) + 12  # ref = 4B base id + 8B length
+            # (ref id rides inside the item tag; honest per-gen ranking only)
+            cost = len(dl) + 6
             if best is None or cost < best[2]:
                 best = ("baseref", bi, cost, dl)
-        # dedup cost approximation: shared chunks count * 0 (shared) +
-        # unique chunks once (charged on first generation that owns them)
-        # -> dedup is a GLOBAL scheme; per-generation cost attributed:
-        # chunk shared with earlier gen costs 4B id; unique chunk costs
-        # its mdrc-chunk share. We compute global dedup total separately
-        # and do NOT charge it per-gen here; instead compare globally.
-        choices.append(best if best and best[2] < ind_cost
-                       else ("independent", 0, ind_cost))
+        # K6 arm candidate: top-ranked base, encoded as sub-page byte-range
+        # refs. Fully charged via ledger (hdr+ops+lit == total, asserted in
+        # encode_k6).
+        # ponytail: one trial per gen (top-ranked base only) - the shingle
+        # index over all history is the expensive part; widening base trials
+        # is the upgrade path if the gate shows base-choice regret.
+        if use_k6:
+            lo = max(0, gi - max_depth)
+            pool = list(range(lo, gi))
+            keep = rank_bases(history_fps[gi],
+                              [history_fps[b] for b in pool], top=1)
+            k6cand = [pool[t] for t in keep]
+            if gi - 1 not in k6cand:
+                k6cand.append(gi - 1)
+            k6bi = k6cand[0]
+            trials_done += 1
+            k6w, k6led = mdrk6.encode_k6(g, [gens[k6bi]],
+                                         base_ids=[k6bi])
+            k6_wires[gi] = (k6bi, k6w)
+        # per-gen item choice: k6 item only when strictly smaller than the
+        # best baseref (this affects ONLY the pergen layout's item kinds;
+        # the archive-wide k6 method always uses k6 items, measured below)
+        if best is None:
+            choices.append(("independent", 0, 0))
+            continue
+        if use_k6 and len(k6_wires[gi][1]) + 6 < best[2]:
+            choices.append(("k6", k6_wires[gi][0],
+                            len(k6_wires[gi][1]) + 6, k6_wires[gi][1]))
+        else:
+            choices.append(best)
 
-    # Global dedup vs sum of per-gen chosen: compute both totals, pick scheme
-    # for the WHOLE archive (simpler: whole-archive method choice, honest).
-    # dedup total wire:
+    # --- method candidates: serialize EACH candidate archive exactly once
+    #     and measure true bytes (K6-3A identity contract: estimate == wire).
     B = 65536
-    seen = set()
-    dedup_data_bytes = 0   # sum of unique chunk bytes (pre-compression)
-    dedup_refs = 0
-    per_gen_unique = []
-    for ids in chunk_ids:
-        u = 0
-        for h in ids:
-            if h not in seen:
-                seen.add(h)
-                u += 1
-        per_gen_unique.append(u)
-        dedup_refs += len(ids)
-    dedup_total = len(dedup_wire) + 16 * len(seen) \
-        + 4 + 4 * len(chunk_store)   # lens blob: count + n* u32
-    ind_total = sum(c[2] for c in choices) + 4 * len(gens)
-    method = force_method if force_method else \
-        ("dedup" if dedup_total < ind_total else "pergen")
 
-    # --- emit
-    data_section = bytearray()
-    refs = []
-    if method == "pergen":
-        for gi, ch in enumerate(choices):
-            m, bi, cost = ch[0], ch[1], ch[2]
-            if m == "independent":
-                blobs = independent_wires[gi]
-                item = struct.pack("<BIB", 1, len(blobs), 0) + b"".join(blobs)
-                refs.append({"gen": gi, "kind": "independent", "off": len(data_section), "len": len(item)})
-                data_section += item
-            else:
-                dl = ch[3] if len(ch) > 3 else delta_bytes(gens[gi], gens[bi])
-                item = struct.pack("<BIB", 2, 1, bi) + dl
-                refs.append({"gen": gi, "kind": "baseref", "base": bi,
-                             "off": len(data_section), "len": len(item)})
-                data_section += item
+    def _emit(method):
+        """Serialize full archive for `method`; returns (blob, rep_fields)."""
+        data_section = bytearray()
+        refs = []
+        if method == "k6":
+            # gen0 independent, gens 1..n-1 as k6ref items (kind 5)
+            for gi, ch in enumerate(choices):
+                m, bi, cost = ch[0], ch[1], ch[2]
+                if m == "independent":
+                    blobs = independent_wires[gi]
+                    item = struct.pack("<BIB", 1, len(blobs), 0) \
+                        + b"".join(blobs)
+                    refs.append({"gen": gi, "kind": "independent",
+                                 "off": len(data_section), "len": len(item)})
+                    data_section += item
+                else:
+                    k6w = k6_wires[gi][1]
+                    item = struct.pack("<BIB", 5, len(k6w), k6_wires[gi][0]) \
+                        + k6w
+                    refs.append({"gen": gi, "kind": "k6ref",
+                                 "base": k6_wires[gi][0],
+                                 "off": len(data_section), "len": len(item)})
+                    data_section += item
+        elif method == "pergen":
+            for gi, ch in enumerate(choices):
+                m, bi, cost = ch[0], ch[1], ch[2]
+                if m == "independent":
+                    blobs = independent_wires[gi]
+                    item = struct.pack("<BIB", 1, len(blobs), 0) \
+                        + b"".join(blobs)
+                    refs.append({"gen": gi, "kind": "independent",
+                                 "off": len(data_section), "len": len(item)})
+                    data_section += item
+                elif m == "k6":
+                    k6w = k6_wires[gi][1]
+                    item = struct.pack("<BIB", 5, len(k6w),
+                                       k6_wires[gi][0]) + k6w
+                    refs.append({"gen": gi, "kind": "k6ref",
+                                 "base": k6_wires[gi][0],
+                                 "off": len(data_section), "len": len(item)})
+                    data_section += item
+                else:
+                    dl = ch[3] if len(ch) > 3 else delta_bytes(gens[gi], gens[bi])
+                    item = struct.pack("<BIB", 2, 1, bi) + dl
+                    refs.append({"gen": gi, "kind": "baseref", "base": bi,
+                                 "off": len(data_section), "len": len(item)})
+                    data_section += item
+        else:
+            # unique chunks stored once (variable length!); lens walked by id.
+            # chunkstore item = hdr(1+4) + mdrc seg(store) + lensblob
+            # lensblob = u32 blob_len + u32 count + count* u32 (self-describing)
+            unique_order = list(chunk_store.items())
+            lens_blob = struct.pack("<II", 4 * (len(unique_order) + 2),
+                                    len(unique_order)) + b"".join(
+                struct.pack("<I", len(c)) for _, c in unique_order)
+            item = struct.pack("<BI", 3, len(dedup_wire) + len(lens_blob)) \
+                + dedup_wire + lens_blob
+            refs.append({"gen": -1, "kind": "chunkstore", "off": 0,
+                         "len": len(item)})
+            data_section += item
+            for gi, ids in enumerate(chunk_ids):
+                payload = struct.pack("<I", len(ids)) + \
+                    b"".join(h[:8] for h in ids)  # 8B truncated ids
+                it = struct.pack("<BIB", 4, len(payload), 0) + payload
+                refs.append({"gen": gi, "kind": "chunklist",
+                             "off": len(data_section), "len": len(it)})
+                data_section += it
+
+        # manifest: methods, refs, hashes, chunk sizes
+        manifest["method"] = method
+        manifest["items"] = refs
+        manifest["hashes"] = gen_meta
+        manifest["lengths"] = [len(g) for g in gens]
+        manifest["selector"] = selector
+        assert 0 <= trials_done < 10 ** 10
+        manifest["selector_trials"] = "%010d" % trials_done
+        man_b = json.dumps(manifest, separators=(",", ":")).encode()
+        idx_b = json.dumps({"chunk_size": B if method == "dedup" else None,
+                            "seg_size": SEG},
+                           separators=(",", ":")).encode()
+        body = struct.pack("<II", zlib.crc32(man_b) & 0xFFFFFFFF,
+                           zlib.crc32(idx_b) & 0xFFFFFFFF) \
+            + man_b + idx_b + bytes(data_section)
+        header = struct.pack("<4sBBIIQ", MAGIC_HDR, VERSION, 0,
+                             len(man_b), len(idx_b), 22 + len(body) + 48)
+        sha = hashlib.sha256(body).digest()
+        footer = struct.pack("<4sIQ", MAGIC_FTR, len(gens), len(body)) + sha
+        blob = header + body + footer
+        return blob, {"manifest_bytes": len(man_b),
+                      "data_bytes": len(data_section)}
+
+    # K6-3A: candidate sizes are the serialized archive itself.
+    # ponytail: all candidates held in memory (~3x archive size); a counting
+    # writer is the upgrade path if archives approach RAM.
+    cands = []
+    if force_method is None:
+        for m in ("dedup", "pergen") + (("k6",) if use_k6 else ()):
+            blob_m, fields_m = _emit(m)
+            cands.append((len(blob_m), m, blob_m, fields_m))
     else:
-        # unique chunks stored once (variable length!); lens walked by id.
-        # chunkstore item = hdr(1+4) + mdrc seg(store) + lensblob
-        # lensblob = u32 blob_len + u32 count + count* u32 (self-describing)
-        unique_order = list(chunk_store.items())
-        lens_blob = struct.pack("<II", 4 * (len(unique_order) + 2),
-                                len(unique_order)) + b"".join(
-            struct.pack("<I", len(c)) for _, c in unique_order)
-        item = struct.pack("<BI", 3, len(dedup_wire) + len(lens_blob)) \
-            + dedup_wire + lens_blob
-        refs.append({"gen": -1, "kind": "chunkstore", "off": 0, "len": len(item)})
-        data_section += item
-        for gi, ids in enumerate(chunk_ids):
-            payload = struct.pack("<I", len(ids)) + \
-                b"".join(h[:8] for h in ids)  # 8B truncated ids
-            it = struct.pack("<BIB", 4, len(payload), 0) + payload
-            refs.append({"gen": gi, "kind": "chunklist", "off": len(data_section),
-                         "len": len(it)})
-            data_section += it
+        blob_m, fields_m = _emit(force_method)
+        cands.append((len(blob_m), force_method, blob_m, fields_m))
+    # exact argmin over measured sizes (ties -> first in candidate order)
+    archive_len, method, out_blob, out_fields = min(
+        cands, key=lambda c: c[0])
+    archive_len = len(out_blob)
 
-    # manifest: methods, refs, hashes, chunk sizes
-    manifest["method"] = method
-    manifest["items"] = refs
-    manifest["hashes"] = gen_meta
-    manifest["lengths"] = [len(g) for g in gens]
-    manifest["selector"] = selector
-    assert 0 <= trials_done < 10 ** 10
-    manifest["selector_trials"] = "%010d" % trials_done  # byte-stable json
-    man_b = json.dumps(manifest, separators=(",", ":")).encode()
-    idx_b = json.dumps({"chunk_size": B if method == "dedup" else None,
-                        "seg_size": SEG},
-                       separators=(",", ":")).encode()
-    # header: magic, ver, flags, ngen, man_len, idx_len, total_len
-    # struct "<4sBBIIQ": 4s + B + B + I + I + Q = 6 fields, 22 bytes LE.
-    # ngen rides in the MANIFEST (json); flag bit0 of ver-byte marks backup.
-    body = struct.pack("<II", zlib.crc32(man_b) & 0xFFFFFFFF,
-                       zlib.crc32(idx_b) & 0xFFFFFFFF) + man_b + idx_b + bytes(data_section)
-    total_len = 22 + len(body) + 48
-    header = struct.pack("<4sBBIIQ", MAGIC_HDR, VERSION, 0,
-                         len(man_b), len(idx_b), total_len)
-    sha = hashlib.sha256(body).digest()
-    footer = struct.pack("<4sIQ", MAGIC_FTR, len(gens), len(body)) + sha
     fd = os.open(outPath + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
-        os.write(fd, header)
-        os.write(fd, body)
+        os.write(fd, out_blob[:22])
         os.fsync(fd)
-        os.write(fd, footer)
+        os.write(fd, out_blob[22:-48])
+        os.fsync(fd)
+        os.write(fd, out_blob[-48:])
         os.fsync(fd)
     finally:
         os.close(fd)
     os.rename(outPath + ".part", outPath)
-    return {"generations": len(gens), "method": method,
-            "manifest_bytes": len(man_b), "data_bytes": len(data_section),
-            "archive": len(header) + len(body) + len(footer),
-            "raw_total": sum(len(g) for g in gens),
-            "selector": selector, "delta_trials": trials_done}
+    rep = {"generations": len(gens), "method": method, **out_fields,
+           "archive": archive_len,
+           "raw_total": sum(len(g) for g in gens),
+           "selector": selector, "delta_trials": trials_done}
+    # K6-3A identity assert: reported archive == serialized candidate length
+    assert rep["archive"] == len(out_blob)
+    return rep
 
 
 # ------------------------------------------------------------- unpack
@@ -447,19 +534,23 @@ def sha_ok(blob):
 
 def _restore_gen(manifest, index, data, gi, cache):
     refs = manifest["items"]
-    r = refs[gi] if manifest["method"] == "pergen" else refs[1 + gi]
+    r = refs[gi] if manifest["method"] in ("pergen", "k6") else refs[1 + gi]
     kind = r["kind"]
     if kind == "independent":
         item = data[r["off"]:r["off"] + r["len"]]
         (k, nb, _) = struct.unpack("<BIB", item[:6])
         off = 6
+        # each body's RAW length: SEG-bounded chunks of the generation
+        # (out_len drives D3 page_join padding and codec trimming)
+        glen = manifest["lengths"][gi]
+        body_lens = [min(SEG, glen - i * SEG) for i in range(nb)]
         out = bytearray()
-        for _ in range(nb):
+        for bi in range(nb):
             seg = item[off:]
-            out += _decode_seg_body(seg, out_len=manifest["lengths"][gi])
+            out += _decode_seg_body(seg, out_len=body_lens[bi])
             (clen,) = struct.unpack("<I", seg[2:6])
             off += 10 + clen
-        return bytes(out[:manifest["lengths"][gi]])
+        return bytes(out[:glen])
     if kind == "baseref":
         if r["base"] not in cache:
             raise Mdr3Error("generation %d depends on missing base %d"
@@ -468,11 +559,12 @@ def _restore_gen(manifest, index, data, gi, cache):
         item = data[r["off"]:r["off"] + r["len"]]
         dl = item[6:]
         (blen, nbc) = struct.unpack("<QI", dl[:12])
+        (opb_len, litb_len) = struct.unpack("<II", dl[12:20])
         bodies = []
-        off = 12
-        for _ in range(2):
+        off = 20
+        for body_len in (opb_len, litb_len):
             seg = dl[off:]
-            bodies.append(_decode_seg_body(seg))
+            bodies.append(_decode_seg_body(seg, out_len=body_len))
             (clen,) = struct.unpack("<I", seg[2:6])
             off += 10 + clen
         opb, litb = bodies
@@ -519,6 +611,22 @@ def _restore_gen(manifest, index, data, gi, cache):
             else:
                 raise Mdr3Error("bad delta op")
         return bytes(out[:manifest["lengths"][gi]])
+    if kind == "k6ref":
+        if r["base"] not in cache:
+            raise Mdr3Error("generation %d depends on missing base %d"
+                            % (gi, r["base"]))
+        base = cache[r["base"]]
+        item = data[r["off"]:r["off"] + r["len"]]
+        (k, wlen, bref) = struct.unpack("<BIB", item[:6])
+        if k != 5:
+            raise Mdr3Error("k6 item corrupted (kind %d)" % k)
+        wire = item[6:6 + wlen]
+        # G7: bounds before decode; decode_k6 raises on any violation
+        out = mdrk6.decode_k6(wire, [base])
+        if len(out) != manifest["lengths"][gi]:
+            raise Mdr3Error("k6 restore length mismatch (got %d want %d)"
+                            % (len(out), manifest["lengths"][gi]))
+        return bytes(out)
     if kind == "chunkstore":
         # item = hdr(1+4) + mdrc seg(store) + lensblob.
         # lensblob = u32 blob_len L + u32 count + count* u32 lens.
@@ -594,13 +702,13 @@ def unpack(archive_path, out_dir):
     if manifest["method"] == "dedup":
         order = list(range(n))
     else:
-        # chain-resolve
+        # chain-resolve (k6ref and baseref both have "base")
         resolved = set()
         while pending:
             progressed = False
             for gi in pending:
                 r = manifest["items"][gi]
-                if r["kind"] == "independent" or r["base"] in resolved:
+                if r["kind"] == "independent" or r.get("base") in resolved:
                     order.append(gi)
                     resolved.add(gi)
                     pending.remove(gi)
@@ -640,7 +748,7 @@ def latest(archive_path, out_path):
             progressed = False
             for gi in pending:
                 r = manifest["items"][gi]
-                if r["kind"] == "independent" or r["base"] in resolved:
+                if r["kind"] == "independent" or r.get("base") in resolved:
                     order.append(gi)
                     resolved.add(gi)
                     pending.remove(gi)
