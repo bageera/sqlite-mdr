@@ -98,7 +98,7 @@ def _wire_seg(data):
                        zlib.crc32(stored) & 0xFFFFFFFF) + stored
 
 
-def _decode_seg(seg):
+def _decode_seg(seg, out_len=None):
     codec, param = struct.unpack("<BB", seg[:2])
     (clen,) = struct.unpack("<I", seg[2:6])
     stored = seg[10:10 + clen]
@@ -111,10 +111,14 @@ def _decode_seg(seg):
     if codec == 1:
         return data
     if codec == 2:
-        return mdrc.unshuffle_bytes(data, param)
+        data = mdrc.unshuffle_bytes(data, param)
     if codec == 3:
-        return mdrc.unbit_shuffle(data)
-    raise Mdr6Error("codec %d not supported in K6 bodies" % codec)
+        data = mdrc.unbit_shuffle(data)
+    # transform codecs pad to the stride multiple; trim to the declared
+    # raw length (out_len) so op-stream arithmetic stays exact
+    if out_len is None:
+        raise Mdr6Error("transform-coded body missing declared raw length")
+    return data[:out_len]
 
 
 # ------------------------------------------------------------------ matcher
@@ -216,6 +220,7 @@ def encode_k6(target, bases, base_ids=None):
     w_lit = _wire_seg(bytes(litb))
     hdr = (MAGIC + struct.pack("<QHII", union_len, len(bases),
                                len(w_op), len(w_lit)) +
+           struct.pack("<II", len(opb), len(litb)) +
            b"".join(struct.pack("<I", i) for i in ids))
     ledger = {"ops_raw": len(opb), "ops_wire": len(w_op),
               "lit_raw": len(litb), "lit_wire": len(w_lit),
@@ -232,14 +237,15 @@ def encode_k6(target, bases, base_ids=None):
 
 def decode_k6(wire, bases):
     """Inverse of encode_k6. Byte-exact target or Mdr6Error."""
-    if len(wire) < 4 + 18:
+    if len(wire) < 4 + 18 + 8:
         raise Mdr6Error("wire shorter than fixed header")
     if wire[:4] != MAGIC:
         raise Mdr6Error("bad K6 magic")
     (union_len, n_bases, opb_len, litb_len) = struct.unpack_from(
         "<QHII", wire, 4)
+    (ops_raw, lits_raw) = struct.unpack_from("<II", wire, 22)
     base_ids = []
-    off = 22
+    off = 30
     if len(wire) < off + 4 * n_bases:
         raise Mdr6Error("wire truncated in base-id table")
     for i in range(n_bases):
@@ -248,8 +254,9 @@ def decode_k6(wire, bases):
     if len(wire) < off + opb_len + litb_len:
         raise Mdr6Error("wire truncated (need %d, have %d)"
                         % (off + opb_len + litb_len, len(wire)))
-    opb = _decode_seg(wire[off:off + opb_len])
-    litb = _decode_seg(wire[off + opb_len:off + opb_len + litb_len])
+    opb = _decode_seg(wire[off:off + opb_len], out_len=ops_raw)
+    litb = _decode_seg(wire[off + opb_len:off + opb_len + litb_len],
+                       out_len=lits_raw)
     union = b"".join(bases)
     if len(union) != union_len:
         raise Mdr6Error("base union length mismatch (%d != %d)"
